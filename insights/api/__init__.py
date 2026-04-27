@@ -49,8 +49,10 @@ def get_user_info():
     )
 
     user = frappe.db.get_value(
-        "User", frappe.session.user, ["first_name", "last_name", "user_type"], as_dict=1
+        "User", frappe.session.user, ["first_name", "last_name", "user_type", "language"], as_dict=1
     )
+
+    locale = user.get("language") or frappe.db.get_single_value("System Settings", "language") or "en"
 
     _is_admin = is_admin or frappe.session.user == "Administrator"
 
@@ -68,11 +70,13 @@ def get_user_info():
         "is_user": is_user or frappe.session.user == "Administrator",
         # TODO: move to `get_session_info` since not user specific
         "country": frappe.db.get_single_value("System Settings", "country"),
-        "locale": frappe.db.get_single_value("System Settings", "language"),
+        "locale": locale,
         "is_v2_instance": frappe.db.count("Insights Query") > 0,
         "default_version": get_user_default("insights_default_version", frappe.session.user),
         "has_desk_access": user.get("user_type") == "System User",
         "has_demo_data": has_demo_data,
+        "fiscal_year_start": frappe.get_single_value("Insights Settings", "fiscal_year_start")
+        or "01-04-2020",
     }
 
 
@@ -239,13 +243,17 @@ def run_doc_method(method: str, docs: dict | str, args: dict | None = None):
             raise frappe.PermissionError("You don't have permission to access this method")
 
         doc = frappe.get_doc(doctype, name)
-        return _execute_doc_method(doc, method, args, ignore_permissions=True)
+        frappe.flags.insights_for_public_access = True
+        try:
+            return _execute_doc_method(doc, method, args, ignore_permissions=True)
+        finally:
+            frappe.flags.insights_for_public_access = False
 
 
 def is_public_method(doctype: str, method: str):
     public_methods = {
         "Insights Query v3": ["execute", "download_results"],
-        "Insights Dashboard v3": ["get_distinct_column_values"],
+        "Insights Dashboard v3": ["get_distinct_column_values", "track_view"],
     }
 
     if doctype in public_methods and method in public_methods[doctype]:
