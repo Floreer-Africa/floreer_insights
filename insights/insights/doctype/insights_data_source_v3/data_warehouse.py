@@ -20,6 +20,7 @@ from ibis.common.exceptions import TableNotFound
 from ibis.expr.types import Expr, Table
 
 import insights
+from insights.insights.doctype.insights_data_source_v3.connectors.duckdb import get_local_duckdb_connection
 from insights.utils import InsightsDataSourcev3, InsightsTablev3
 
 WAREHOUSE_DB_NAME = "insights"
@@ -39,30 +40,16 @@ class Warehouse:
     def get_connection(self, database: str | None = None, read_only: bool = True) -> DuckDBBackend:
         path = self.get_db_path()
 
-        if not os.path.exists(path):
-            db = ibis.duckdb.connect(path)
-            db.disconnect()
-
-        db = ibis.duckdb.connect(path, read_only=read_only)
-
-        if not read_only:
-            self._configure_temp_directory_access(db)
+        db = get_local_duckdb_connection(
+            path,
+            read_only=read_only,
+            allowed_dir=str(Path(tempfile.gettempdir())) if not read_only else None,
+        )
 
         if database:
             db.raw_sql(f"USE '{database}'")
 
         return db
-
-    def _configure_temp_directory_access(self, db: DuckDBBackend) -> None:
-        tmp_dir = str(Path(tempfile.gettempdir())).replace("'", "''")
-
-        # Some environments start with external access already disabled.
-        # Best effort: try enabling it first, then configure directory allowlist.
-        with suppress(Exception):
-            db.raw_sql("SET enable_external_access = true")
-
-        db.raw_sql(f"SET allowed_directories = ['{tmp_dir}']")
-        db.raw_sql("SET enable_external_access = false")
 
     def create_database(self, database: str):
         with self.get_write_connection() as db:
@@ -637,7 +624,7 @@ class WarehouseTableImporter:
                 t.last_sync_bookmark = str(new_bookmark)
                 self._log(f"Bookmark updated: {self.primary_key} = {new_bookmark}")
 
-        t.save()
+        t.save(ignore_permissions=True)
 
     def _read_warehouse_bookmark(self):
         """Query DuckDB for the MAX cursor value after a successful incremental import.
