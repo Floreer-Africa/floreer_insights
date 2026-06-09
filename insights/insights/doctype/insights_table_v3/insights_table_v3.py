@@ -6,6 +6,7 @@ from hashlib import md5
 
 import frappe
 import ibis
+import sqlglot as sg
 from frappe.model.document import Document
 from frappe.permissions import get_valid_perms
 from frappe.query_builder.functions import Count, Max, Sum
@@ -35,6 +36,8 @@ class InsightsTablev3(Document):
         sync_cursor_column: DF.Data | None
         sync_from: DF.Datetime | None
         sync_mode: DF.Literal["Full", "Incremental"]
+        sync_primary_key_column: DF.Data | None
+        sync_strategy: DF.Literal["Append Only", "Update or Insert"]
         table: DF.Data
     # end: auto-generated types
 
@@ -61,26 +64,19 @@ class InsightsTablev3(Document):
             # Can't connect right now — skip validation rather than blocking save.
             return
 
-        if not self.sync_cursor_column:
-            frappe.throw(
-                "Incremental sync requires a Cursor Column. "
-                "Set it to the datetime column that marks when rows were created (e.g., <b>creation</b>)."
-            )
+        self.sync_strategy = self.sync_strategy or "Append Only"
 
         if not self.sync_cursor_column:
-            for candidate in ("creation", "timestamp"):
-                if candidate in remote.columns:
+            for candidate in ("modified", "creation", "timestamp"):
+                if candidate in remote.columns and remote[candidate].type().is_temporal():
                     self.sync_cursor_column = candidate
-                    return
+                    break
+
+        if not self.sync_cursor_column:
             frappe.throw(
                 "Incremental sync requires a Cursor Column. "
-                "Set it to the datetime column that marks when rows were created (e.g., <b>creation</b>)."
+                "Set it to the datetime column that tracks when rows changed (for example <b>modified</b> or <b>creation</b>)."
             )
-            return
-
-        # Auto-detected candidates are known-good; only validate user-specified columns.
-        if self.sync_cursor_column in ("creation", "timestamp"):
-            return
 
         if self.sync_cursor_column not in remote.columns:
             frappe.throw(
@@ -93,6 +89,18 @@ class InsightsTablev3(Document):
                 f"Cursor Column <b>{self.sync_cursor_column}</b> must be a datetime/date column, "
                 f"but its type is <b>{col_type}</b>."
             )
+
+        if self.sync_strategy == "Update or Insert":
+            if not self.sync_primary_key_column:
+                frappe.throw(
+                    "Incremental upsert sync requires a Primary Key Column. "
+                    "Set it to the stable column that uniquely identifies each logical row."
+                )
+
+            if self.sync_primary_key_column not in remote.columns:
+                frappe.throw(
+                    f"Primary Key Column <b>{self.sync_primary_key_column}</b> does not exist in <b>{self.table}</b>."
+                )
 
     @staticmethod
     def bulk_create(data_source: str, tables: list[str]):
@@ -297,6 +305,10 @@ def apply_user_permissions(t: Table, data_source, table_name):
             return t
         return t.filter(t.doctype.isin(allowed_single_doctypes))
 
+    # 1. Column-level (permlevel) read permissions: drop columns the user can't read.
+    t = apply_column_permissions(t, table_name)
+
+    # 2. Row-level permissions: keep only the rows the user is allowed to see.
     permission_query = get_permission_query_for_table(table_name)
     if not permission_query:
         return t.filter(False)
@@ -304,22 +316,75 @@ def apply_user_permissions(t: Table, data_source, table_name):
     if not _has_where_clause(permission_query):
         return t
 
-    from_warehouse = isinstance(t.get_backend(), DuckDBBackend)
-    if not from_warehouse:
-        return t.sql(permission_query)
+    return apply_row_permissions(t, data_source, table_name, permission_query)
 
-    # if from warehouse,
-    # we will have to transform the `permission_query` to duckdb dialect and also replace the table names from `tabX` to `site_db.tabX` to use it as a subquery to filter the table `t`
-    # to avoid the complexity of transforming the `permission_query` to duckdb dialect, we will execute the `permission_query` separately and get the list of permitted names and then filter the table `t` using semi_join
 
+def apply_column_permissions(t: Table, table_name):
+    """Restrict `t` to the columns the current user is permitted to read (permlevel).
+
+    Uses frappe's `get_permitted_fields` as the source of truth and applies it as an
+    explicit projection, so column-level security is enforced consistently whether `t`
+    comes from the warehouse (DuckDB) or a live site-db connection.
+    """
+    allowed = get_permitted_columns_for_table(table_name)
+    cols = [c for c in t.columns if c in allowed]
+    # If nothing is permitted, the row filter below will block all rows anyway; selecting
+    # an empty column list is invalid in ibis, so leave the projection untouched here.
+    return t.select(cols) if cols else t
+
+
+def apply_row_permissions(t: Table, data_source, table_name, permission_query):
     if "name" not in t.columns:
         frappe.throw(
             f"Cannot apply user permissions for table {table_name} because it does not have a `name` column"
         )
 
-    db = InsightsDataSourcev3.get_doc(data_source)._get_ibis_backend()
-    names_expr = ibis.memtable(db.sql(permission_query).select("name"))
+    from_warehouse = isinstance(t.get_backend(), DuckDBBackend)
+    if from_warehouse:
+        # `t` is on DuckDB but the permission query must run against the live site-db (a
+        # different backend), so execute it separately and materialize the permitted names.
+        db = InsightsDataSourcev3.get_doc(data_source)._get_ibis_backend()
+        names_expr = ibis.memtable(db.sql(permission_query).select("name"))
+    else:
+        # Same backend: keep it lazy so it compiles to a single SQL statement (semi-join
+        # subquery) — no extra DB round trip.
+        names_expr = t.sql(permission_query).select("name")
+
     return t.semi_join(names_expr, "name")
+
+
+def get_permitted_columns_for_table(table_name) -> set[str]:
+    """Columns the current user may read for `table_name`.
+
+    For unrestricted doctypes this is the full column set (so the projection is a no-op).
+    Returns an empty set when nothing is permitted (the caller's row filter then blocks
+    all rows).
+    """
+    from frappe.model import get_permitted_fields, optional_fields
+
+    doctype = table_name.removeprefix("tab")
+    meta = frappe.get_meta(doctype)
+
+    def permitted(dt, parent=None) -> set[str]:
+        # get_permitted_fields drops optional meta columns (`_assign`, `_comments`, ...)
+        # because they aren't in valid_columns; add them back so they survive.
+        return {*get_permitted_fields(doctype=dt, parenttype=parent), *optional_fields}
+
+    if not meta.istable:
+        if not frappe.has_permission(doctype, "read"):
+            return set()
+        return permitted(doctype)
+
+    # Child table: union the permitted columns across every permitted parent doctype,
+    # mirroring how get_permission_query_for_table builds the row filter.
+    permitted_parents = [p for p in get_parents(doctype) if frappe.has_permission(p, "read")]
+    if not permitted_parents:
+        return set()
+
+    allowed: set[str] = set()
+    for parent in permitted_parents:
+        allowed |= permitted(doctype, parent)
+    return allowed
 
 
 def get_permission_query_for_table(table_name) -> str | None:
@@ -356,10 +421,13 @@ def get_permission_query_for_table(table_name) -> str | None:
 
 
 def get_permission_query(doctype, parent_doctype=None):
+    # Used purely as a row filter (semi_join on `name`), so we only need `name` plus the
+    # permission WHERE/match conditions. Column-level (permlevel) restrictions are applied
+    # separately via apply_column_permissions().
     return str(
         frappe.get_list(
             doctype,
-            fields="*",
+            fields=["name"],
             order_by=None,
             parent_doctype=parent_doctype,
             run=False,
@@ -393,4 +461,8 @@ def get_parents(child_doctype):
 
 
 def _has_where_clause(sql: str) -> bool:
-    return " where " in sql.lower()
+    try:
+        stmt = sg.parse_one(sql)
+        return stmt.find(sg.exp.Where) is not None
+    except Exception:
+        return " where " in sql.replace("\n", " ").lower()

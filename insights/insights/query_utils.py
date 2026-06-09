@@ -6,7 +6,12 @@ import sqlglot as sg
 
 
 def extract_sql_table_refs(raw_sql: str, dialect: sg.Dialect | None = None) -> list[frappe._dict]:
-    parsed = sg.parse_one(raw_sql, dialect=dialect)
+    try:
+        parsed = sg.parse_one(raw_sql, dialect=dialect)
+    except Exception:
+        # If parsing fails, we return an empty list to avoid blocking the user from saving their query.
+        # In the future, we may want to log these exceptions to help improve our SQL parsing capabilities.
+        return []
 
     cte_aliases = {
         str(alias)
@@ -102,10 +107,8 @@ def sync_query_references(query_name: str, operations) -> None:
     from frappe.model.document import bulk_insert
 
     ops = frappe.parse_json(operations) or []
-    frappe.db.delete("Insights Query Reference", {"query": query_name})
 
     docs = []
-
     all_table_deps = extract_table_deps_from_operations(ops) + extract_table_deps_from_sql_operations(ops)
     for tbl in all_table_deps:
         ref = frappe.new_doc("Insights Query Reference")
@@ -124,6 +127,7 @@ def sync_query_references(query_name: str, operations) -> None:
         ref.ref_query = dep_query
         docs.append(ref)
 
+    frappe.db.delete("Insights Query Reference", {"query": query_name})
     if docs:
         bulk_insert("Insights Query Reference", docs)
 
