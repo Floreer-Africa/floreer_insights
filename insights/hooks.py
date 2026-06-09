@@ -16,7 +16,7 @@ add_to_apps_screen = [
         "name": "insights",
         "logo": "/assets/insights/frontend/insights-logo.png",
         "title": "Insights",
-        "route": "/insights",
+        "route": "/desk/insights",
         "has_permission": "insights.permissions.check_app_permission",
     }
 ]
