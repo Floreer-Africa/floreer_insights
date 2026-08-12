@@ -22,7 +22,17 @@ add_to_apps_screen = [
         "name": "insights",
         "logo": "/assets/insights/frontend/insights-logo.png",
         "title": "Insights",
-        "route": "/desk/insights",
+        # Floreer vendored-fork patch (framework#176). Built from the SAME
+        # variable as `website_route_rules` below so the advertised route and the
+        # served route cannot drift. Upstream hard-coded "/desk/insights" here in
+        # `17352599 feat: serve Desk SPA under /desk/* path` without adding a
+        # matching route rule, and `04515d33` (#1262) then rebuilt the rules
+        # around `insights_path` (default "insights") without revisiting this
+        # line — so out of the box the app advertised /desk/insights and served
+        # /insights. /desk/<anything> resolves to frappe's bare `desk` template,
+        # whose SPA looks for a workspace of that name, finds none and bounces:
+        # a flickering blank page with no error and no Error Log row.
+        "route": f"/{insights_path}",
         "has_permission": "insights.permissions.check_app_permission",
     }
 ]
